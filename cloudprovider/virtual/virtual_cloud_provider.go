@@ -47,11 +47,14 @@ type VirtualNodeGroup struct {
 	templateNodeCreationTime time.Time
 }
 
-var _ cloudprovider.CloudProvider = (*VirtualCloudProvider)(nil)
-var _ cloudprovider.NodeGroup = (*VirtualNodeGroup)(nil)
-var virtualNodeListCache = cache.NewExpiring()
-var virtualNodesKey = "virtual-nodes"
-var virtualNodesExpiry = 50 * time.Second
+var (
+	_                                  cloudprovider.CloudProvider = (*VirtualCloudProvider)(nil)
+	_                                  cloudprovider.NodeGroup     = (*VirtualNodeGroup)(nil)
+	virtualNodeListCache                                           = cache.NewExpiring()
+	virtualNodesKey                                                = "virtual-nodes"
+	virtualNodesExpiry                                             = 50 * time.Second
+	DefaultVirtualAutoscalerConfigPath                             = "/tmp/vas-config.json"
+)
 
 const GPULabel = "virtual/gpu"
 
@@ -91,7 +94,7 @@ func BuildVirtual(opts config.AutoscalingOptions, do cloudprovider.NodeGroupDisc
 	//TODO replace with configmap
 	virtualAutoscalerConfigPath := os.Getenv("VIRTUAL_AUTOSCALER_CONFIG")
 	if virtualAutoscalerConfigPath == "" {
-		virtualAutoscalerConfigPath = "/tmp/vas-config.json"
+		virtualAutoscalerConfigPath = DefaultVirtualAutoscalerConfigPath
 		klog.Warningf("VIRTUAL_AUTOSCALER_CONFIG not set. Assuming %s", virtualAutoscalerConfigPath)
 	}
 	cloudProvider, err := InitializeFromVirtualConfig(virtualAutoscalerConfigPath, clientSet, rl)
@@ -522,7 +525,7 @@ func checkAndGetFileLastModifiedTime(filePath string) (lastModifiedTime time.Tim
 	return
 }
 
-func loadAutoscalerConfig(filePath string) (config gsc.AutoscalerConfig, err error) {
+func LoadAutoscalerConfig(filePath string) (config gsc.AutoscalerConfig, err error) {
 	bytes, err := os.ReadFile(filePath)
 	if err != nil {
 		return
@@ -534,6 +537,13 @@ func loadAutoscalerConfig(filePath string) (config gsc.AutoscalerConfig, err err
 	}
 
 	return
+}
+func SaveAutoscalerConfig(filePath string, config gsc.AutoscalerConfig) error {
+	bytes, err := json.Marshal(config)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filePath, bytes, 0644)
 }
 
 func (vcp *VirtualCloudProvider) reloadVirtualNodeGroups() error {
@@ -770,7 +780,7 @@ func (vcp *VirtualCloudProvider) Refresh() error {
 	//	return nil
 	//}
 	klog.V(2).Infof("Triggering reload of virtual autoscalerConfig %q since lastModifiedTime %q is different from configLastModifiedTime %q", vcp.configPath, lastModifiedTime, vcp.configLastModifiedTime)
-	autoscalerConfig, err := loadAutoscalerConfig(vcp.configPath)
+	autoscalerConfig, err := LoadAutoscalerConfig(vcp.configPath)
 	if err != nil {
 		return fmt.Errorf("cannot load virtual autoscaling config from %q: %w", vcp.configPath, err)
 	}
@@ -1342,4 +1352,29 @@ func readMachineDeploymentInfos(mcdsJsonFile string) ([]gsc.MachineDeploymentInf
 		mcdInfos[i] = mcdInfo
 	}
 	return mcdInfos, nil
+}
+
+func PauseCA(ctx context.Context) error {
+	cfg, err := LoadAutoscalerConfig(DefaultVirtualAutoscalerConfigPath)
+	if err != nil {
+		return err
+	}
+	cfg.Mode = gsc.AutoscalerReplayerPauseMode
+	err = SaveAutoscalerConfig(DefaultVirtualAutoscalerConfigPath, cfg)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+func UnPauseCA(ctx context.Context) error {
+	cfg, err := LoadAutoscalerConfig(DefaultVirtualAutoscalerConfigPath)
+	if err != nil {
+		return err
+	}
+	cfg.Mode = gsc.AutoscalerReplayerRunMode
+	err = SaveAutoscalerConfig(DefaultVirtualAutoscalerConfigPath, cfg)
+	if err != nil {
+		return err
+	}
+	return nil
 }

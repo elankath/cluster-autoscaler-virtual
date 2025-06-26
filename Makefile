@@ -1,143 +1,94 @@
-ALL_ARCH = amd64 arm64 s390x
-all: $(addprefix build-arch-,$(ALL_ARCH))
+# Change these variables as necessary.
+main_package_path = .
+binary_name = cluster-autoscaler
 
-TAG?=dev
-FLAGS=
-#LDFLAGS?=-s
-ENVVAR=CGO_ENABLED=0
-GOOS?=$(shell go env GOOS)
-GOARCH?=$(shell go env GOARCH)
-REGISTRY?=staging-k8s.gcr.io
-DOCKER_NETWORK?=default
-SUPPORTED_BUILD_TAGS=$(shell ls cloudprovider/builder/ | grep -e '^builder_.*\.go' | sed 's/builder_\(.*\)\.go/\1/')
-ifdef BUILD_TAGS
-  TAGS_FLAG=--tags ${BUILD_TAGS}
-  PROVIDER=-${BUILD_TAGS}
-  FOR_PROVIDER=" for ${BUILD_TAGS}"
-else
-  TAGS_FLAG=
-  PROVIDER=
-  FOR_PROVIDER=
-endif
-ifdef LDFLAGS
-  LDFLAGS_FLAG=--ldflags "${LDFLAGS}"
-else
-  LDFLAGS_FLAG=
-endif
-ifdef DOCKER_RM
-  RM_FLAG=--rm
-else
-  RM_FLAG=
-endif
-ifndef AWS_REGION
-  AWS_REGION=$(shell aws configure get region)
-endif
+# ==================================================================================== #
+# HELPERS
+# ==================================================================================== #
 
-IMAGE=$(REGISTRY)/cluster-autoscaler$(PROVIDER)
+## help: print this help message
+.PHONY: help
+help:
+	@echo 'Usage:'
+	@sed -n 's/^##//p' ${MAKEFILE_LIST} | column -t -s ':' |  sed -e 's/^/ /'
 
-export DOCKER_CLI_EXPERIMENTAL := enabled
+.PHONY: confirm
+confirm:
+	@echo -n 'Are you sure? [y/N] ' && read ans && [ $${ans:-N} = y ]
 
+.PHONY: no-dirty
+no-dirty:
+	@test -z "$(shell git status --porcelain)"
+
+
+# ==================================================================================== #
+# QUALITY CONTROL
+# ==================================================================================== #
+
+## audit: run quality control checks
+.PHONY: audit
+audit: test
+	go mod tidy -diff
+	go mod verify
+	test -z "$(shell gofmt -l .)"
+	go vet ./...
+	go run honnef.co/go/tools/cmd/staticcheck@latest -checks=all,-ST1000,-U1000 ./...
+	go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+## test: run all tests
+.PHONY: test
+test:
+	go test -v -race -buildvcs ./...
+
+## test/cover: run all tests and display coverage
+.PHONY: test/cover
+test/cover:
+	go test -v -race -buildvcs -coverprofile=/tmp/coverage.out ./...
+	go tool cover -html=/tmp/coverage.out
+
+## upgradeable: list direct dependencies that have upgrades available
+.PHONY: upgradeable
+upgradeable:
+	@go list -u -f '{{if (and (not (or .Main .Indirect)) .Update)}}{{.Path}}: {{.Version}} -> {{.Update.Version}}{{end}}' -m all
+
+
+# ==================================================================================== #
+# DEVELOPMENT
+# ==================================================================================== #
+
+## tidy: tidy modfiles and format .go files
+.PHONY: tidy
+tidy:
+	go mod tidy -v
+	go fmt ./...
+
+## build: build the application
+.PHONY: build
 build:
-	@$(MAKE) build-arch-$(GOARCH)
+	go build -buildvcs -o=${binary_name} ${main_package_path}
+	go build -buildvcs -o=scalesim cmd/scalesim/main.go
 
-build-arch-%: clean-arch-%
-	$(ENVVAR) GOOS=$(GOOS) GOARCH=$* go build -o cluster-autoscaler-$* ${LDFLAGS_FLAG} ${TAGS_FLAG}
 
-test-build-tags:
-	@if [ -z "$(SUPPORTED_BUILD_TAGS)" ]; then \
-		echo "No supported build tags found"; \
-		exit 1; \
-	fi
-	@for tag in $(SUPPORTED_BUILD_TAGS); do \
-		echo "Testing build with tag $$tag"; \
-		BUILD_TAGS=$$tag $(MAKE) build || exit 1; \
-	done
+## run: run the  application TODO: Make this work instead of using script
+.PHONY: run
+run: build
+	./${binary_name}
 
-test-unit: clean build
-	go test --test.short -race ./... ${TAGS_FLAG}
+## run/live: run the application with reloading on file changes
+.PHONY: run/live
+run/live:
+	go run github.com/cosmtrek/air@v1.43.0 \
+	    --build.cmd "make build" --build.bin "${binary_name}" --build.delay "100" \
+	    --build.exclude_dir "" \
+	    --build.include_ext "go, tpl, tmpl, html, css, scss, js, ts, sql, jpeg, jpg, gif, png, bmp, svg, webp, ico" \
+	    --misc.clean_on_exit "true"
 
-dev-release: dev-release-arch-$(GOARCH)
 
-dev-release-arch-%: build-arch-% make-image-arch-% push-image-arch-%
-	@echo "Release ${TAG}${FOR_PROVIDER}-$* completed"
+# ==================================================================================== #
+# OPERATIONS
+# ==================================================================================== #
 
-make-image: make-image-arch-$(GOARCH)
-
-make-image-arch-%:
-ifdef BASEIMAGE
-	docker build --pull --build-arg BASEIMAGE=${BASEIMAGE} \
-		-t ${IMAGE}-$*:${TAG} \
-		-f Dockerfile.$* .
-else
-	docker build --pull \
-		-t ${IMAGE}-$*:${TAG} \
-		-f Dockerfile.$* .
-endif
-	@echo "Image ${TAG}${FOR_PROVIDER}-$* completed"
-
-push-image: push-image-arch-$(GOARCH)
-
-push-image-arch-%:
-	./push_image.sh ${IMAGE}-$*:${TAG}
-
-push-manifest:
-	docker manifest create ${IMAGE}:${TAG} \
-	    $(addprefix $(REGISTRY)/cluster-autoscaler$(PROVIDER)-, $(addsuffix :$(TAG), $(ALL_ARCH)))
-	docker manifest push --purge ${IMAGE}:${TAG}
-
-execute-release: $(addprefix make-image-arch-,$(ALL_ARCH)) $(addprefix push-image-arch-,$(ALL_ARCH)) push-manifest
-	@echo "Release ${TAG}${FOR_PROVIDER} completed"
-
-clean: clean-arch-$(GOARCH)
-
-clean-arch-%:
-	rm -f cluster-autoscaler-$*
-
-generate:
-	AWS_REGION=$(AWS_REGION) go generate ./cloudprovider/aws
-
-format:
-	test -z "$$(find . -path ./vendor -prune -type f -o -name '*.go' -exec gofmt -s -d {} + | tee /dev/stderr)" || \
-	test -z "$$(find . -path ./vendor -prune -type f -o -name '*.go' -exec gofmt -s -w {} + | tee /dev/stderr)"
-
-docker-builder:
-	docker build --network=${DOCKER_NETWORK} -t autoscaling-builder ../builder
-
-build-in-docker: build-in-docker-arch-$(GOARCH)
-
-build-in-docker-arch-%: clean-arch-% docker-builder
-	docker run ${RM_FLAG} -v `pwd`:/gopath/src/k8s.io/autoscaler/cluster-autoscaler/:Z autoscaling-builder:latest \
-		bash -c 'cd /gopath/src/k8s.io/autoscaler/cluster-autoscaler && BUILD_TAGS=${BUILD_TAGS} LDFLAGS="${LDFLAGS}" make build-arch-$*'
-
-release: $(addprefix build-in-docker-arch-,$(ALL_ARCH)) execute-release
-	@echo "Full in-docker release ${TAG}${FOR_PROVIDER} completed"
-
-container: container-arch-$(GOARCH)
-
-container-arch-%: build-in-docker-arch-% make-image-arch-%
-	@echo "Full in-docker image ${TAG}${FOR_PROVIDER}-$* completed"
-
-test-in-docker: clean docker-builder
-	docker run ${RM_FLAG} -v `pwd`:/cluster-autoscaler/:Z autoscaling-builder:latest bash -c 'cd /cluster-autoscaler && go test -race ./... ${TAGS_FLAG}'
-
-.PHONY: all build test-unit clean format execute-release dev-release docker-builder build-in-docker release generate push-image push-manifest
-
-## Location to install dependencies to
-LOCALBIN ?= $(shell pwd)/bin
-$(LOCALBIN):
-	mkdir -p $(LOCALBIN)
-
-## Tool Binaries
-CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
-
-## Tool Versions
-CONTROLLER_TOOLS_VERSION ?= v0.14.0
-
-.PHONY: controller-gen
-controller-gen: $(CONTROLLER_GEN) ## Download controller-gen locally if necessary.
-$(CONTROLLER_GEN): $(LOCALBIN)
-	test -s $(LOCALBIN)/controller-gen || GOBIN=$(LOCALBIN) go install sigs.k8s.io/controller-tools/cmd/controller-gen@$(CONTROLLER_TOOLS_VERSION)
-
-.PHONY: manifest
-manifest: controller-gen ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
-	$(CONTROLLER_GEN) rbac:roleName=manager-role crd webhook paths="./apis/..." output:crd:artifacts:config=apis/config/crd
+## push: push changes to the remote Git repository
+.PHONY: push
+push: confirm audit no-dirty
+	git push
