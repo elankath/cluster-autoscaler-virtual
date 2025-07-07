@@ -3,9 +3,11 @@ package virtual
 import (
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	gsc "github.com/elankath/gardener-scaling-common"
 	"github.com/elankath/gardener-scaling-common/clientutil"
+	"github.com/go-logr/logr"
 	"github.com/samber/lo"
 	"golang.org/x/sync/errgroup"
 	corev1 "k8s.io/api/core/v1"
@@ -21,7 +23,7 @@ import (
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
 	"k8s.io/autoscaler/cluster-autoscaler/config"
 	"k8s.io/autoscaler/cluster-autoscaler/simulator/framework"
-	"k8s.io/autoscaler/cluster-autoscaler/utils/errors"
+	caserrors "k8s.io/autoscaler/cluster-autoscaler/utils/errors"
 	"k8s.io/autoscaler/cluster-autoscaler/utils/gpu"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
@@ -54,6 +56,11 @@ var (
 	virtualNodesKey                                                = "virtual-nodes"
 	virtualNodesExpiry                                             = 50 * time.Second
 	DefaultVirtualAutoscalerConfigPath                             = "/tmp/vas-config.json"
+)
+
+var (
+	RefreshSuccess = "refresh success: %s"
+	RefreshFailed  = fmt.Errorf("refresh failed: %w")
 )
 
 const GPULabel = "virtual/gpu"
@@ -484,7 +491,7 @@ func (vcp *VirtualCloudProvider) HasInstance(node *corev1.Node) (bool, error) {
 	return true, cloudprovider.ErrNotImplemented
 }
 
-func (vcp *VirtualCloudProvider) Pricing() (cloudprovider.PricingModel, errors.AutoscalerError) {
+func (vcp *VirtualCloudProvider) Pricing() (cloudprovider.PricingModel, caserrors.AutoscalerError) {
 	return nil, cloudprovider.ErrNotImplemented
 }
 
@@ -543,6 +550,7 @@ func SaveAutoscalerConfig(filePath string, config gsc.AutoscalerConfig) error {
 	if err != nil {
 		return err
 	}
+	config.Hash = config.GetHash()
 	return os.WriteFile(filePath, bytes, 0644)
 }
 
@@ -771,14 +779,9 @@ func (vcp *VirtualCloudProvider) Refresh() error {
 	if err != nil {
 		return fmt.Errorf("cannot look up virtual autoscaler autoscalerConfig at path: %s, error: %s", vcp.configPath, err)
 	}
-	//if vcp.launchTime.After(lastModifiedTime) {
-	//	klog.Warningf("Ignoring Old virtual autoscalerConfig  %q with time %q created before the CA launch time %q", vcp.configPath, lastModifiedTime, vcp.launchTime)
-	//	return nil
-	//}
-	//if vcp.configLastModifiedTime.Equal(lastModifiedTime) {
-	//	klog.V(2).Infof("Skipping load of virtual autoscalerConfig %q since lastModifiedTime %q is unchanged", vcp.configPath, lastModifiedTime)
-	//	return nil
-	//}
+	if vcp.launchTime.After(lastModifiedTime) {
+		return fmt.Errorf("Ignoring Old virtual autoscalerConfig  %q with time %q created before the CA launch time %q", vcp.configPath, lastModifiedTime, vcp.launchTime)
+	}
 	klog.V(2).Infof("Triggering reload of virtual autoscalerConfig %q since lastModifiedTime %q is different from configLastModifiedTime %q", vcp.configPath, lastModifiedTime, vcp.configLastModifiedTime)
 	autoscalerConfig, err := LoadAutoscalerConfig(vcp.configPath)
 	if err != nil {
@@ -793,7 +796,7 @@ func (vcp *VirtualCloudProvider) Refresh() error {
 	err = doRefresh(vcp, oldLastModifiedTime)
 	if err != nil {
 		msg = err.Error()
-		//writeSignal(vcp.config.ErrorSignalPath, msg)
+		writeSignal(vcp.config.ErrorSignalPath, msg)
 		return err
 	}
 	msg = fmt.Sprintf("succesfully refreshed. instanceCount=%d", vcp.getInstanceCount())
@@ -814,12 +817,12 @@ func (vcp *VirtualCloudProvider) getInstanceCount() (instanceCount int) {
 }
 
 func writeSignal(signalPath string, msg string) {
-	//err := os.WriteFile(signalPath, []byte(msg), 0644)
-	//if err != nil {
-	//	klog.Warningf("cannot write message %q to signalPath %q due to error: %s", msg, signalPath, err)
-	//	return
-	//}
-	//klog.Infof("wrote message %q to signalPath %q", msg, signalPath)
+	err := os.WriteFile(signalPath, []byte(msg), 0644)
+	if err != nil {
+		klog.Warningf("cannot write message %q to signalPath %q due to error: %s", msg, signalPath, err)
+		return
+	}
+	klog.Infof("wrote message %q to signalPath %q", msg, signalPath)
 }
 func doRefresh(vcp *VirtualCloudProvider, oldLastModifiedTime time.Time) error {
 	if vcp.configLastModifiedTime.Equal(oldLastModifiedTime) {
@@ -1377,4 +1380,52 @@ func UnPauseCA(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+func WaitForVirtualCARefresh(ctx context.Context, log logr.Logger, numNodes int, successSignalPath string, errorSignalPath string) error {
+	log.Info("waitForVirtualCARefresh entered..", "successSignalPath", successSignalPath, "errorSignalPath", errorSignalPath)
+	waitInterval := 20 * time.Second
+	timeout := 5 * time.Minute
+	computedTimeout := time.Duration(2*numNodes) * time.Second
+	if computedTimeout > timeout {
+		timeout = computedTimeout
+	}
+	timeoutCh := time.After(timeout)
+	for {
+		var err error
+		var data []byte
+		select {
+		case <-ctx.Done():
+			log.Info("waitForVirtualCARefresh context cancelled or timed out:", "error", ctx.Err())
+			return ctx.Err()
+		case <-timeoutCh:
+			err = fmt.Errorf("waitForVirtualCARefresh exceeded signalTimeout %q waiting for %q or %q", timeout, successSignalPath, errorSignalPath)
+			log.Error(err, "waitForVirtualCARefresh exceeded timeoutCh.", "timeout", timeout)
+			return err
+		case <-time.After(waitInterval):
+			log.Info("waitForVirtualCARefresh checking signal paths.", "successSignalPath", successSignalPath, "errorSignalPath", errorSignalPath)
+			data, err = os.ReadFile(errorSignalPath)
+			if data != nil {
+				errorSignal := string(data)
+				err = fmt.Errorf("virtual CA signalled issue: %s", errorSignal)
+				log.Error(err, "waitForVirtualCARefresh obtained error signal.", "errorSignal", errorSignal, "errorSignalPath", errorSignalPath)
+				return err
+			}
+			if !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("waitForVirtualCARefresh got error reading %q: %w", errorSignalPath, err)
+			}
+			data, err = os.ReadFile(successSignalPath)
+			if err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("waitForVirtualCARefresh got error reading %q: %w", successSignalPath, err)
+			}
+			if data != nil {
+				successSignal := string(data)
+				log.Info("waitForVirtualCARefresh obtained success signal.", "successSignal", successSignal, "successSignalPath", successSignalPath)
+				if err = os.Remove(successSignalPath); err != nil {
+					return err
+				}
+				return nil
+			}
+		}
+	}
 }

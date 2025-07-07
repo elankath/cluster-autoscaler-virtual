@@ -17,6 +17,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
+	"k8s.io/kubernetes/pkg/api/v1/pod"
 	"math"
 	"os"
 	"slices"
@@ -44,7 +45,6 @@ func main() {
 		os.Exit(ExitErrParseOpts)
 	}
 	log = klog.NewKlogr()
-
 	err = simulateScaling(context.Background(), mainOpts)
 	if err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -63,12 +63,18 @@ func simulateScaling(ctx context.Context, mo *MainOpts) error {
 	if err != nil {
 		return err
 	}
-	log.Info("Pausing the virtual CA...")
-	err = virtual.PauseCA(ctx)
+	log.Info("Saving AutoscalerConfig with pause mode for virtual CA...")
+	cs.AutoscalerConfig.Mode = gsc.AutoscalerReplayerPauseMode
+	cs.AutoscalerConfig.SuccessSignalPath = "/tmp/success.signal"
+	cs.AutoscalerConfig.ErrorSignalPath = "/tmp/error.signal"
+	err = virtual.SaveAutoscalerConfig(virtual.DefaultVirtualAutoscalerConfigPath, cs.AutoscalerConfig)
 	if err != nil {
 		return err
 	}
-	<-time.After(5 * time.Second)
+	err = virtual.WaitForVirtualCARefresh(ctx, log, len(cs.AutoscalerConfig.ExistingNodes), cs.AutoscalerConfig.SuccessSignalPath, cs.AutoscalerConfig.ErrorSignalPath)
+	if err != nil {
+		return err
+	}
 	err = syncVirtualCluster(ctx, client, cs)
 	if err != nil {
 		return err
@@ -80,6 +86,7 @@ func simulateScaling(ctx context.Context, mo *MainOpts) error {
 		return err
 	}
 	log.Info("Unscheduled pod names", "unscheduledPodNames", usPodNames)
+	//  kubectl get pods -A -o json | jq -r '.items[] | select(.spec.nodeName == null) | [.metadata.namespace, .metadata.name] | @tsv'
 	log.Info("Unpausing the virtual CA...")
 	err = virtual.UnPauseCA(ctx)
 	<-time.After(mo.StabilizeInterval)
@@ -87,6 +94,32 @@ func simulateScaling(ctx context.Context, mo *MainOpts) error {
 		return err
 	}
 	return nil
+}
+
+func waitTillPodStabilized(ctx context.Context, client *kubernetes.Clientset, stabilizeInterval time.Duration) error {
+	pods, err := clientutil.ListAllPods(ctx, client)
+	if err != nil {
+		return err
+	}
+	mark := time.Now()
+	checkInterval := time.Second * 5
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(checkInterval):
+			if time.Since(mark) > stabilizeInterval {
+				return nil
+			}
+			for _, p := range pods {
+				_, cond := pod.GetPodCondition(&p.Status, corev1.PodScheduled)
+				if cond != nil && cond.Status == corev1.ConditionTrue {
+					continue
+				}
+			}
+
+		}
+	}
 }
 
 func loadClusterSnapshot(filePath string) (cs gsc.ClusterSnapshot, err error) {
@@ -116,7 +149,11 @@ func syncVirtualCluster(ctx context.Context, client *kubernetes.Clientset, cs gs
 		}
 		log.Info("syncVirtualCluster successfully created the priority class", "pc.Name", pClass.Name)
 	}
-	err = deployPods(ctx, client, cs.Pods)
+	err = deployScheduledPods(ctx, client, cs.Pods)
+	if err != nil {
+		return err
+	}
+	err = deployUnScheduledPods(ctx, client, cs.Pods)
 	if err != nil {
 		return err
 	}
@@ -182,6 +219,7 @@ func ValidateMainOpts(opts *MainOpts) error {
 	return nil
 }
 func deployScheduledPods(ctx context.Context, client *kubernetes.Clientset, pods []gsc.PodInfo) error {
+	pods = slices.Clone(pods)
 	pods = slices.DeleteFunc(pods, func(info gsc.PodInfo) bool {
 		return info.NodeName == "" || info.Spec.NodeName == ""
 	})
@@ -192,15 +230,16 @@ func deployScheduledPods(ctx context.Context, client *kubernetes.Clientset, pods
 	return deployPods(ctx, client, pods)
 }
 func deployUnScheduledPods(ctx context.Context, client *kubernetes.Clientset, pods []gsc.PodInfo) error {
+	pods = slices.Clone(pods)
 	pods = slices.DeleteFunc(pods, func(info gsc.PodInfo) bool {
 		return info.NodeName != "" || info.Spec.NodeName != ""
 	})
-	for _, pod := range pods {
-		if pod.NodeName == "" && pod.Spec.NodeName != "" {
-			return fmt.Errorf("for %q pod.NodeName empty but pode.Spec.NodeName non-empty", pod.Name)
+	for _, p := range pods {
+		if p.NodeName == "" && p.Spec.NodeName != "" {
+			return fmt.Errorf("for %q p.NodeName empty but pode.Spec.NodeName non-empty", p.Name)
 		}
-		if pod.NodeName != "" && pod.Spec.NodeName == "" {
-			return fmt.Errorf("for %q pod.NodeName not empty but pode.Spec.NodeName empty", pod.Name)
+		if p.NodeName != "" && p.Spec.NodeName == "" {
+			return fmt.Errorf("for %q p.NodeName not empty but pode.Spec.NodeName empty", p.Name)
 		}
 	}
 	slices.SortFunc(pods, func(a, b gsc.PodInfo) int {
@@ -233,7 +272,7 @@ func doDeployPod(ctx context.Context, clientSet *kubernetes.Clientset, pod corev
 	// TODO ensure you don't deploy pods that are already present in the cluster
 	podNew, err := clientSet.CoreV1().Pods(pod.Namespace).Create(ctx, &pod, metav1.CreateOptions{})
 	if err != nil {
-		return fmt.Errorf("doDeployPod cannot create the pod  %s: %w", pod.Name, err)
+		return fmt.Errorf("doDeployPod cannot create the pod  %q: %w", pod.Name, err)
 	}
 	if podNew.Spec.NodeName != "" {
 		podNew.Status.Phase = corev1.PodRunning

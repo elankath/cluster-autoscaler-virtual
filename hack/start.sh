@@ -13,6 +13,8 @@ cleanup() {
   fi
   for p in $(pgrep -f kvcl); do kill -9 $p;done
   for p in $(pgrep -f envtest); do kill -9 $p;done
+
+  for p in $(pgrep -f procmon); do kill -9 $p;done
 }
 
 trap cleanup EXIT
@@ -29,16 +31,16 @@ if [[ ! -f "$caBin" ]]; then
   exit 1
 fi
 
-clusterSnapshotPath="$1"
-if [[ -z "$clusterSnapshotPath" ]]; then
-  echoErr "Usage: ./hack/start.sh <clusterSnapshotPath>"
-  exit 2
-fi
+#clusterSnapshotPath="$1"
+#if [[ -z "$clusterSnapshotPath" ]]; then
+#  echoErr "Usage: ./hack/start.sh <clusterSnapshotPath>"
+#  exit 2
+#fi
 
-if [[ ! -f "$clusterSnapshotPath" ]]; then
-  echoErr "No clusterSnapshotPath at: $clusterSnapshotPath"
-  exit 2
-fi
+#if [[ ! -f "$clusterSnapshotPath" ]]; then
+#  echoErr "No clusterSnapshotPath at: $clusterSnapshotPath"
+#  exit 2
+#fi
 
 kvclDir="$goPath/src/github.com/unmarshall/kvcl"
 launcherKvcl="$kvclDir/hack/launch.sh"
@@ -60,18 +62,23 @@ fi
 echo "Launched KVCL with pid: $kvclPid"
 
 
-
 virtualKubecfg="/tmp/kvcl.yaml"
 if [[ ! -f /tmp/kvcl.yaml ]]; then
   echoErr "$virtualKubecfg is not present"
   exit 3
 fi
 
+echo "Launching procmon.."
+(
+procmon -d /tmp -n scale-perf cluster-autoscaler kube-apiserver
+) &
+procmonPid=$!
+sleep 10
+if [[ -z  $(pgrep procmon ) ]]; then
+  echoErr "procmon seem to have failed launched. Aborting"
+  exit 4
+fi
 
-export VIRTUAL_AUTOSCALER_CONFIG="/tmp/vas-config.json"
-echo "Extracting VAS Config from $clusterSnapshotPath to $VIRTUAL_AUTOSCALER_CONFIG..."
-jq '.AutoscalerConfig' "$clusterSnapshotPath" > "$VIRTUAL_AUTOSCALER_CONFIG"
-echo "Building CA Virtual..."
 echo "Starting CA Virtual with VIRTUAL_AUTOSCALER_CONFIG: $VIRTUAL_AUTOSCALER_CONFIG"
 "$caBin" --kubeconfig "$virtualKubecfg" \
   --leader-elect=false \
