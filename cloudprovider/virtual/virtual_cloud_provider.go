@@ -65,6 +65,8 @@ var (
 
 const GPULabel = "virtual/gpu"
 
+var virtualCloudProvider *VirtualCloudProvider
+
 type VirtualCloudProvider struct {
 	launchTime             time.Time
 	config                 *gsc.AutoscalerConfig
@@ -109,6 +111,7 @@ func BuildVirtual(opts config.AutoscalingOptions, do cloudprovider.NodeGroupDisc
 		klog.Fatalf("cannot initialize virtual autoscaler from virtual autoscaler config path: %s", err)
 		return nil
 	}
+	virtualCloudProvider = cloudProvider
 	return cloudProvider
 
 }
@@ -927,6 +930,7 @@ func (v *VirtualNodeGroup) IncreaseSize(delta int) error {
 		klog.Infof("IncreaseSize created a new node with name: %s", createdNode.Name)
 	}
 	time.AfterFunc(1*time.Second, func() { v.changeCreatingInstancesToRunning(ctx, fmt.Sprintf("NG.IncreaseSize")) })
+	klog.Infof("IncreaseSize SCALING finished for %q with delta %d, duration=%s", v.Name, delta, time.Now().Sub(virtualCloudProvider.configLastModifiedTime))
 	return nil
 }
 

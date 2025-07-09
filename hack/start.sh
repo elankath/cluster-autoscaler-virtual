@@ -68,16 +68,17 @@ if [[ ! -f /tmp/kvcl.yaml ]]; then
   exit 3
 fi
 
-echo "Launching procmon.."
-(
-procmon -d /tmp -n scale-perf cluster-autoscaler kube-apiserver
-) &
-procmonPid=$!
-sleep 10
-if [[ -z  $(pgrep procmon ) ]]; then
-  echoErr "procmon seem to have failed launched. Aborting"
-  exit 4
-fi
+
+#echo "Launching procmon.."
+#(
+#procmon -d /tmp/perf -n ca-perf cluster-autoscaler kube-apiserver
+#) &
+#procmonPid=$!
+#sleep 10
+#if [[ -z  $(pgrep procmon ) ]]; then
+#  echoErr "procmon seem to have failed launched. Aborting"
+#  exit 4
+#fi
 
 echo "Starting CA Virtual with VIRTUAL_AUTOSCALER_CONFIG: $VIRTUAL_AUTOSCALER_CONFIG"
 "$caBin" --kubeconfig "$virtualKubecfg" \
